@@ -25,6 +25,15 @@ version in [`docs/changelog/`](docs/changelog/):
   two API keys has two circuits.
   ([#1619](https://github.com/akitaonrails/ai-memory/issues/1619))
 
+- Changed the LLM fallback chain to log its own events. A transient candidate
+  failure now logs a warning with that candidate's provider, model, chain
+  position, error class, HTTP status and cooldown, and an info line records
+  each change of the answering candidate. Before, the chain logged nothing,
+  and callers such as the reranker named only the first candidate, so a log
+  could blame the primary for a timeout another candidate caused. Response
+  bodies are never logged.
+  ([#1622](https://github.com/akitaonrails/ai-memory/pull/1622))
+
 ## [3.2.0] - 2026-10-21
 
 ### Added

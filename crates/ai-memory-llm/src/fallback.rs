@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use jiff::Timestamp;
+use tracing::{debug, info, warn};
 
 use crate::error::{LlmError, LlmResult};
 use crate::health::CandidateHealth;
@@ -143,19 +144,65 @@ impl FallbackLlmProvider {
             state.last_success_at = Some(Timestamp::now());
             state.circuit_open_until = None;
         }
-        *self.last_selected.lock().unwrap_or_else(|e| e.into_inner()) = Some(index);
+        let previous = self
+            .last_selected
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .replace(index);
+        // Logged on a change of answering candidate only, so a primary that
+        // stays down for an hour yields one line instead of one per call.
+        let switched = match previous {
+            Some(previous) => previous != index,
+            None => index > 0,
+        };
+        if switched {
+            let candidate = &self.entries[index].candidate;
+            info!(
+                provider = candidate.provider,
+                model = %candidate.model,
+                position = index,
+                "llm fallback chain now answering from this candidate"
+            );
+        }
     }
 
     fn record_error(&self, index: usize, err: &LlmError) {
-        let mut state = self.entries[index]
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        state.last_error_at = Some(Timestamp::now());
-        state.last_error_status = err.http_status();
-        state.last_error_class = Some(err.class());
-        if err.is_transient() {
-            state.circuit_open_until = Some(Instant::now() + circuit_cooldown(err));
+        let cooldown = err.is_transient().then(|| circuit_cooldown(err));
+        {
+            let mut state = self.entries[index]
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            state.last_error_at = Some(Timestamp::now());
+            state.last_error_status = err.http_status();
+            state.last_error_class = Some(err.class());
+            if let Some(cooldown) = cooldown {
+                state.circuit_open_until = Some(Instant::now() + cooldown);
+            }
+        }
+        // Redacted fields only, as the reranker does: the `Display` of a
+        // provider failure carries the upstream response body. The model is
+        // the failing candidate's, which the caller cannot see: every caller
+        // labels the chain with its first candidate.
+        let candidate = &self.entries[index].candidate;
+        match cooldown {
+            Some(cooldown) => warn!(
+                provider = candidate.provider,
+                model = %candidate.model,
+                position = index,
+                error_class = err.class(),
+                error_status = ?err.http_status(),
+                cooldown_secs = cooldown.as_secs(),
+                "llm fallback candidate failed; skipping it until its cooldown ends"
+            ),
+            None => debug!(
+                provider = candidate.provider,
+                model = %candidate.model,
+                position = index,
+                error_class = err.class(),
+                error_status = ?err.http_status(),
+                "llm fallback candidate failed deterministically; the chain stops here"
+            ),
         }
     }
 
@@ -873,5 +920,137 @@ mod tests {
             .await
             .unwrap();
         assert!(circuit_open_for(&unhinted, 0) <= CIRCUIT_COOLDOWN);
+    }
+
+    /// Collects what a subscriber writes so a test can assert on log lines.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLog {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    fn capture_info_logs() -> (CapturedLog, tracing::subscriber::DefaultGuard) {
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::INFO)
+            .with_ansi(false)
+            .finish();
+        (captured, tracing::subscriber::set_default(subscriber))
+    }
+
+    #[tokio::test]
+    async fn a_transient_failure_logs_the_failing_candidate_without_its_body() {
+        let (log, _guard) = capture_info_logs();
+        let chain = FallbackLlmProvider::new(vec![
+            Candidate::new(
+                "openai-compat",
+                "gemini-3.8-flash",
+                Arc::new(ScriptedLlm::err(
+                    "openai-compat",
+                    "gemini-3.8-flash",
+                    LlmError::Provider {
+                        status: 429,
+                        body: "quota body sk-secret-echo".into(),
+                        retry_after: Some(Duration::from_secs(600)),
+                    },
+                )),
+            ),
+            Candidate::new(
+                "openai-compat",
+                "gemini-3.6-flash",
+                Arc::new(ScriptedLlm::ok("openai-compat", "gemini-3.6-flash", "ok")),
+            ),
+        ]);
+
+        chain
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap();
+
+        let text = log.text();
+        let failure = text
+            .lines()
+            .find(|line| line.contains("skipping it until its cooldown ends"))
+            .expect("the transient failure is logged");
+        assert!(failure.contains("gemini-3.8-flash"), "{failure}");
+        assert!(failure.contains("429"), "{failure}");
+        assert!(failure.contains("cooldown_secs=600"), "{failure}");
+        assert!(!text.contains("sk-secret-echo"), "the body leaked: {text}");
+        assert!(
+            text.lines()
+                .any(|line| line.contains("now answering") && line.contains("gemini-3.6-flash")),
+            "the switch to the fallback is logged: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_answering_candidate_is_logged_only_when_it_changes() {
+        let (log, _guard) = capture_info_logs();
+        let chain = FallbackLlmProvider::new(vec![
+            Candidate::new(
+                "gemini",
+                "primary",
+                Arc::new(ScriptedLlm::err(
+                    "gemini",
+                    "primary",
+                    LlmError::Provider {
+                        status: 503,
+                        body: "overloaded".into(),
+                        retry_after: None,
+                    },
+                )),
+            ),
+            Candidate::new(
+                "gemini",
+                "spare",
+                Arc::new(ScriptedLlm::ok("gemini", "spare", "ok")),
+            ),
+        ]);
+
+        // The primary's circuit stays open across these calls, so each one is
+        // answered by the spare: one switch, then silence.
+        for _ in 0..3 {
+            chain
+                .complete(ChatRequest::user_prompt("hi"))
+                .await
+                .unwrap();
+        }
+        assert_eq!(log.text().matches("now answering").count(), 1);
+
+        // Control: a chain whose primary answers never logs a switch.
+        let (quiet_log, _quiet_guard) = capture_info_logs();
+        let healthy = FallbackLlmProvider::new(vec![Candidate::new(
+            "gemini",
+            "primary",
+            Arc::new(ScriptedLlm::ok("gemini", "primary", "ok")),
+        )]);
+        healthy
+            .complete(ChatRequest::user_prompt("hi"))
+            .await
+            .unwrap();
+        assert!(!quiet_log.text().contains("now answering"));
     }
 }
